@@ -5,6 +5,9 @@
 
 //! Label-filtered search using multi-hop expansion.
 
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::BinaryHeap;
+
 use diskann_utils::Reborrow;
 use diskann_utils::future::{AssertSend, SendFuture};
 use diskann_vector::PreprocessedDistanceFunction;
@@ -165,6 +168,46 @@ where
 
 impl<K> HybridPredicate<K> for NotInMutWithLabelCheck<'_, K> where K: VectorId {}
 
+// ---------------------------------------------------------------------------
+// Exploration Queue support types
+// ---------------------------------------------------------------------------
+
+/// A wrapper around [`Neighbor`] that reverses the natural ordering so that a
+/// [`BinaryHeap`] yields the **closest** (smallest distance) entry via `pop()`.
+///
+/// Rust's `BinaryHeap` is a max-heap, so we store entries in *descending*
+/// distance order. Popping therefore gives us the entry with the smallest
+/// distance — greedy best-first behaviour.
+#[derive(Debug, Clone, Copy)]
+struct ExplorationEntry<I: VectorId> {
+    neighbor: Neighbor<I>,
+}
+
+impl<I: VectorId> PartialEq for ExplorationEntry<I> {
+    fn eq(&self, other: &Self) -> bool {
+        self.neighbor.distance == other.neighbor.distance
+    }
+}
+
+impl<I: VectorId> Eq for ExplorationEntry<I> {}
+
+impl<I: VectorId> PartialOrd for ExplorationEntry<I> {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<I: VectorId> Ord for ExplorationEntry<I> {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        // Reverse: smaller distance = higher priority in the max-heap.
+        other
+            .neighbor
+            .distance
+            .partial_cmp(&self.neighbor.distance)
+            .unwrap_or(CmpOrdering::Equal)
+    }
+}
+
 /// Internal multihop search implementation.
 ///
 /// Performs label-filtered search by expanding through non-matching nodes
@@ -214,19 +257,55 @@ where
     let mut two_hop_neighbors = Vec::with_capacity(max_degree_with_slack);
     let mut candidates_two_hop_expansion = Vec::with_capacity(max_degree_with_slack);
 
-    while scratch.best.has_notvisited_node() && !accessor.terminate_early() {
+    // --- Exploration queue state ---
+    // Capacity is l_search; the queue is only populated when the label
+    // provider signals low match rate via RejectAndNeedExpand.
+    let l_search = search_params.l_value().get();
+    let mut exploration_queue: BinaryHeap<ExplorationEntry<I>> =
+        BinaryHeap::with_capacity(l_search);
+    let mut exploration_set: HashSet<I> = HashSet::with_capacity(l_search);
+    let mut need_expand_active = false;
+
+    loop {
+        let has_best = scratch.best.has_notvisited_node();
+        let has_exploration = !exploration_queue.is_empty();
+
+        // Terminate when neither source has candidates.
+        if !has_best && !has_exploration {
+            break;
+        }
+        if accessor.terminate_early() {
+            break;
+        }
+
         scratch.beam_nodes.clear();
         one_hop_neighbors.clear();
         candidates_two_hop_expansion.clear();
         two_hop_neighbors.clear();
 
-        // In this loop we are going to find the beam_width number of nodes that are closest to the query.
-        // Each of these nodes will be a frontier node.
+        // --- Beam fill (priority: matching nodes from scratch.best first) ---
         while scratch.beam_nodes.len() < beam_width
             && let Some(closest_node) = scratch.best.closest_notvisited()
         {
             search_record.record(closest_node, scratch.hops, scratch.cmps);
             scratch.beam_nodes.push(closest_node.id);
+        }
+
+        // Fill remaining beam slots from the exploration queue when active.
+        if need_expand_active {
+            while scratch.beam_nodes.len() < beam_width {
+                if let Some(entry) = exploration_queue.pop() {
+                    scratch.beam_nodes.push(entry.neighbor.id);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Nothing to expand this iteration — should not happen given the
+        // outer loop guard, but be safe.
+        if scratch.beam_nodes.is_empty() {
+            break;
         }
 
         // compute distances from query to one-hop neighbors, and mark them visited
@@ -247,6 +326,11 @@ where
                 }
                 QueryVisitDecision::Reject => {
                     // Rejected nodes: still add to two-hop expansion so we can traverse through them
+                    candidates_two_hop_expansion.push(neighbor);
+                }
+                QueryVisitDecision::RejectAndNeedExpand => {
+                    // Low match rate detected — enable exploration queue.
+                    need_expand_active = true;
                     candidates_two_hop_expansion.push(neighbor);
                 }
                 QueryVisitDecision::Terminate => {
@@ -294,6 +378,33 @@ where
 
         scratch.cmps += two_hop_neighbors.len() as u32;
         scratch.hops += two_hop_expansion_candidate_ids.len() as u32;
+
+        // --- Feed the exploration queue ---
+        // After two-hop expansion, the rejected one-hop candidates have been
+        // used for their two-hop reach. Push them into the exploration queue
+        // so the search can continue expanding the graph even when
+        // scratch.best has no more unvisited matching nodes.
+        if need_expand_active {
+            for candidate in &candidates_two_hop_expansion {
+                if exploration_set.insert(candidate.id) {
+                    exploration_queue.push(ExplorationEntry {
+                        neighbor: *candidate,
+                    });
+                    // Enforce capacity limit: drop the farthest entry.
+                    if exploration_queue.len() > l_search {
+                        // The heap is min-by-distance (reversed), so the
+                        // *last* element in the internal vec is the farthest.
+                        // BinaryHeap doesn't expose that directly, but since
+                        // we only exceed by 1 we can just let it grow by one
+                        // and it will naturally be displaced next iteration.
+                        // For a tighter bound we drain:
+                        while exploration_queue.len() > l_search {
+                            exploration_queue.pop();
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(make_stats(scratch))

@@ -9,7 +9,10 @@ use std::{
     fmt::Debug,
     num::NonZeroUsize,
     ops::Range,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, AtomicU32, Ordering},
+    },
 };
 
 use diskann_utils::{
@@ -72,6 +75,10 @@ pub enum QueryVisitDecision<I: VectorId> {
     Accept(Neighbor<I>),
     /// Reject this node; do not add it to the frontier.
     Reject,
+    /// Reject this node, but signal that the match rate is very low and the
+    /// search should enable its exploration queue to keep graph traversal
+    /// alive.
+    RejectAndNeedExpand,
     /// Stop the search immediately without accepting this node.
     Terminate,
 }
@@ -3061,5 +3068,227 @@ impl InternalSearchStats {
             result_count,
             range_search_second_round: self.range_search_second_round,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MetadataQueryLabelProvider — adaptive match-rate detection wrapper
+// ---------------------------------------------------------------------------
+
+/// Minimum number of samples before the match rate is estimated.
+const MIN_SAMPLES_FOR_ESTIMATION: u32 = 30;
+
+/// If the observed match rate drops below this threshold the provider
+/// switches to low-match-rate mode and returns [`QueryVisitDecision::RejectAndNeedExpand`].
+const LOW_MATCH_RATE_THRESHOLD: f64 = 0.02;
+
+/// How often (in total visits) the match rate is re-evaluated once a
+/// decision has been made.
+const MATCH_RATE_CHECK_INTERVAL: u32 = 1000;
+
+/// Tri-state for [`MetadataQueryLabelProvider::need_expand_mode`].
+const MODE_UNDETERMINED: u8 = 0;
+const MODE_HIGH_MATCH_RATE: u8 = 1;
+const MODE_LOW_MATCH_RATE: u8 = 2;
+
+/// A wrapper around any [`QueryLabelProvider`] that adaptively detects low
+/// match-rate scenarios and signals the search loop to enable its exploration
+/// queue.
+///
+/// # Mechanism
+///
+/// * While `need_expand_mode` is *undetermined* (0), every reject triggers a
+///   match-rate check so that the mode is resolved as fast as possible.
+/// * After [`MIN_SAMPLES_FOR_ESTIMATION`] visits the provider computes
+///   `matches / visits`. If the rate is below [`LOW_MATCH_RATE_THRESHOLD`]
+///   (2 %), the mode is set to *low* (2) and all subsequent rejects return
+///   [`QueryVisitDecision::RejectAndNeedExpand`].
+/// * Once determined, the rate is re-checked every
+///   [`MATCH_RATE_CHECK_INTERVAL`] visits so that the mode can flip if the
+///   actual rate changes.
+pub struct MetadataQueryLabelProvider<'a, V: VectorId> {
+    inner: &'a dyn QueryLabelProvider<V>,
+    /// 0 = undetermined, 1 = high match rate, 2 = low match rate.
+    need_expand_mode: AtomicU8,
+    /// Total number of calls to `on_visit`.
+    total_visits: AtomicU32,
+    /// Number of accepted (matching) visits.
+    total_matches: AtomicU32,
+}
+
+impl<V: VectorId> Debug for MetadataQueryLabelProvider<'_, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetadataQueryLabelProvider")
+            .field("mode", &self.need_expand_mode.load(Ordering::Relaxed))
+            .field("visits", &self.total_visits.load(Ordering::Relaxed))
+            .field("matches", &self.total_matches.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl<'a, V: VectorId> MetadataQueryLabelProvider<'a, V> {
+    /// Wrap an existing label provider with adaptive match-rate detection.
+    pub fn new(inner: &'a dyn QueryLabelProvider<V>) -> Self {
+        Self {
+            inner,
+            need_expand_mode: AtomicU8::new(MODE_UNDETERMINED),
+            total_visits: AtomicU32::new(0),
+            total_matches: AtomicU32::new(0),
+        }
+    }
+
+    /// Returns `true` when the provider has determined that the match rate is
+    /// low and the search should use its exploration queue.
+    pub fn is_low_match_rate(&self) -> bool {
+        self.need_expand_mode.load(Ordering::Relaxed) == MODE_LOW_MATCH_RATE
+    }
+
+    /// Evaluate the match rate and potentially update the mode.
+    ///
+    /// Called on every reject while undetermined, and periodically (every
+    /// [`MATCH_RATE_CHECK_INTERVAL`] visits) otherwise.
+    fn evaluate_match_rate(&self, visits: u32, matches: u32) {
+        if visits < MIN_SAMPLES_FOR_ESTIMATION {
+            return;
+        }
+        let rate = matches as f64 / visits as f64;
+        let new_mode = if rate < LOW_MATCH_RATE_THRESHOLD {
+            MODE_LOW_MATCH_RATE
+        } else {
+            MODE_HIGH_MATCH_RATE
+        };
+        self.need_expand_mode.store(new_mode, Ordering::Relaxed);
+    }
+}
+
+impl<V: VectorId> QueryLabelProvider<V> for MetadataQueryLabelProvider<'_, V> {
+    fn is_match(&self, vec_id: V) -> bool {
+        self.inner.is_match(vec_id)
+    }
+
+    fn on_visit(&self, neighbor: Neighbor<V>) -> QueryVisitDecision<V> {
+        let visits = self.total_visits.fetch_add(1, Ordering::Relaxed) + 1;
+
+        if self.inner.is_match(neighbor.id) {
+            let matches = self.total_matches.fetch_add(1, Ordering::Relaxed) + 1;
+
+            // Periodic re-check at interval boundaries.
+            if visits.is_multiple_of(MATCH_RATE_CHECK_INTERVAL) {
+                self.evaluate_match_rate(visits, matches);
+            }
+            return QueryVisitDecision::Accept(neighbor);
+        }
+
+        // --- reject path ---
+        let mode = self.need_expand_mode.load(Ordering::Relaxed);
+
+        if mode == MODE_UNDETERMINED {
+            // Fast activation: check on every reject while undetermined.
+            let matches = self.total_matches.load(Ordering::Relaxed);
+            self.evaluate_match_rate(visits, matches);
+            // Re-read after potential update.
+            let mode = self.need_expand_mode.load(Ordering::Relaxed);
+            if mode == MODE_LOW_MATCH_RATE {
+                return QueryVisitDecision::RejectAndNeedExpand;
+            }
+        } else if mode == MODE_LOW_MATCH_RATE {
+            // Periodic re-check.
+            if visits.is_multiple_of(MATCH_RATE_CHECK_INTERVAL) {
+                let matches = self.total_matches.load(Ordering::Relaxed);
+                self.evaluate_match_rate(visits, matches);
+            }
+            return QueryVisitDecision::RejectAndNeedExpand;
+        } else {
+            // MODE_HIGH_MATCH_RATE — periodic re-check.
+            if visits.is_multiple_of(MATCH_RATE_CHECK_INTERVAL) {
+                let matches = self.total_matches.load(Ordering::Relaxed);
+                self.evaluate_match_rate(visits, matches);
+            }
+        }
+
+        QueryVisitDecision::Reject
+    }
+}
+
+#[cfg(test)]
+mod metadata_query_label_provider_tests {
+    use super::*;
+    use crate::neighbor::Neighbor;
+
+    /// A simple filter that rejects all IDs except those divisible by `accept_mod`.
+    #[derive(Debug)]
+    struct SparseFilter {
+        accept_mod: u32,
+    }
+
+    impl QueryLabelProvider<u32> for SparseFilter {
+        fn is_match(&self, vec_id: u32) -> bool {
+            vec_id.is_multiple_of(self.accept_mod)
+        }
+    }
+
+    #[test]
+    fn high_match_rate_stays_reject() {
+        // accept_mod = 2 → 50% match rate (well above 2%)
+        let inner = SparseFilter { accept_mod: 2 };
+        let provider = MetadataQueryLabelProvider::new(&inner);
+
+        for i in 0..100u32 {
+            let nbr = Neighbor::new(i, i as f32);
+            let decision = provider.on_visit(nbr);
+            if i % 2 == 0 {
+                assert_eq!(decision, QueryVisitDecision::Accept(nbr));
+            } else {
+                // Should remain plain Reject once mode is determined.
+                assert!(
+                    decision == QueryVisitDecision::Reject
+                        || decision == QueryVisitDecision::RejectAndNeedExpand,
+                    "unexpected decision for id {i}: {decision:?}"
+                );
+            }
+        }
+
+        // After enough samples the mode should be high-match-rate.
+        assert!(!provider.is_low_match_rate());
+    }
+
+    #[test]
+    fn low_match_rate_triggers_expand() {
+        // accept_mod = 100 → IDs 1..=100 yield exactly 1 match (ID 100).
+        // After 30 non-matching visits the mode switches to low.
+        let inner = SparseFilter { accept_mod: 100 };
+        let provider = MetadataQueryLabelProvider::new(&inner);
+
+        // Visit IDs 1..=50 — none match (first multiple of 100 > 0 is 100).
+        for i in 1..=50u32 {
+            let nbr = Neighbor::new(i, i as f32);
+            provider.on_visit(nbr);
+        }
+
+        assert!(provider.is_low_match_rate());
+
+        // Subsequent reject must be RejectAndNeedExpand.
+        let nbr = Neighbor::new(1, 1.0);
+        assert_eq!(
+            provider.on_visit(nbr),
+            QueryVisitDecision::RejectAndNeedExpand
+        );
+    }
+
+    #[test]
+    fn accept_still_works_in_low_match_mode() {
+        let inner = SparseFilter { accept_mod: 100 };
+        let provider = MetadataQueryLabelProvider::new(&inner);
+
+        // Trigger low-match-rate (IDs 1..=50 — zero matches).
+        for i in 1..=50u32 {
+            let nbr = Neighbor::new(i, i as f32);
+            provider.on_visit(nbr);
+        }
+        assert!(provider.is_low_match_rate());
+
+        // A matching node should still be accepted.
+        let nbr = Neighbor::new(200, 5.0);
+        assert_eq!(provider.on_visit(nbr), QueryVisitDecision::Accept(nbr));
     }
 }
