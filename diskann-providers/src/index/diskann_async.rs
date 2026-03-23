@@ -4381,6 +4381,479 @@ pub(crate) mod tests {
         );
     }
 
+    ////////////////////////////////////////////
+    // Exploration Queue (RejectAndNeedExpand) //
+    ////////////////////////////////////////////
+
+    /// A filter with a very low match rate that signals `RejectAndNeedExpand` for
+    /// non-matching nodes. This triggers the exploration queue in
+    /// `multihop_search_internal`.
+    #[derive(Debug)]
+    struct SparseMatchFilter {
+        /// Only these IDs are considered matching.
+        matching_ids: HashSet<u32>,
+        /// Track total on_visit calls.
+        visit_count: Mutex<usize>,
+        /// Track how many times RejectAndNeedExpand was returned.
+        reject_expand_count: Mutex<usize>,
+    }
+
+    impl SparseMatchFilter {
+        fn new(matching_ids: impl IntoIterator<Item = u32>) -> Self {
+            Self {
+                matching_ids: matching_ids.into_iter().collect(),
+                visit_count: Mutex::new(0),
+                reject_expand_count: Mutex::new(0),
+            }
+        }
+
+        fn visit_count(&self) -> usize {
+            *self.visit_count.lock().unwrap()
+        }
+
+        fn reject_expand_count(&self) -> usize {
+            *self.reject_expand_count.lock().unwrap()
+        }
+    }
+
+    impl QueryLabelProvider<u32> for SparseMatchFilter {
+        fn is_match(&self, vec_id: u32) -> bool {
+            self.matching_ids.contains(&vec_id)
+        }
+
+        fn on_visit(&self, neighbor: Neighbor<u32>) -> QueryVisitDecision<u32> {
+            *self.visit_count.lock().unwrap() += 1;
+            if self.matching_ids.contains(&neighbor.id) {
+                QueryVisitDecision::Accept(neighbor)
+            } else {
+                // Signal low match rate — this activates the exploration queue
+                *self.reject_expand_count.lock().unwrap() += 1;
+                QueryVisitDecision::RejectAndNeedExpand
+            }
+        }
+    }
+
+    /// Helper to build and populate a standard 3D grid index for exploration queue tests.
+    async fn build_grid_index_for_exploration(
+        dim: usize,
+        grid_size: usize,
+        seed: u64,
+    ) -> (PQMemoryIndex<f32>, Vec<Vec<f32>>, usize) {
+        let l = 10;
+        let max_degree = 2 * dim;
+        let num_points = grid_size.pow(dim as u32);
+
+        let (config, parameters) =
+            simplified_builder(l, max_degree, Metric::L2, dim, num_points, no_modify).unwrap();
+
+        let mut adjacency_lists = utils::genererate_3d_grid_adj_list(grid_size as u32);
+        let mut vectors = f32::generate_grid(dim, grid_size);
+
+        adjacency_lists.push((num_points as u32 - 1).into());
+        vectors.push(vec![grid_size as f32; dim]);
+
+        let table = train_pq(
+            squish(vectors.iter(), dim).as_view(),
+            2.min(dim),
+            &mut create_rnd_from_seed_in_tests(seed),
+            1usize,
+        )
+        .unwrap();
+
+        let index = new_quant_index::<f32, _, _>(config, parameters, table, NoDeletes).unwrap();
+        let neighbor_accessor = &mut index.provider().neighbors();
+        populate_data(&index.data_provider, &DefaultContext, &vectors).await;
+        populate_graph(neighbor_accessor, &adjacency_lists).await;
+
+        (index, vectors, num_points)
+    }
+
+    #[tokio::test]
+    async fn test_multihop_reject_and_need_expand_activates_exploration_queue() {
+        // When on_visit returns RejectAndNeedExpand for non-matching nodes,
+        // the exploration queue should be activated, allowing the search to
+        // continue even when scratch.best runs out of unvisited matching nodes.
+        let dim = 3;
+        let grid_size: usize = 5;
+        let num_points = grid_size.pow(dim as u32);
+
+        let (index, _vectors, _) =
+            build_grid_index_for_exploration(dim, grid_size, 0xAABBCCDDEEFF0011).await;
+
+        let query = vec![grid_size as f32; dim];
+
+        // Only match a very sparse subset: the corner point and a few others.
+        // This guarantees most on_visit calls return RejectAndNeedExpand.
+        let matching: HashSet<u32> = (0..num_points as u32).filter(|id| id % 20 == 0).collect();
+        let filter = SparseMatchFilter::new(matching.iter().copied());
+
+        let mut ids = vec![0; 10];
+        let mut distances = vec![0.0; 10];
+        let mut result_output_buffer =
+            search_output_buffer::IdDistance::new(&mut ids, &mut distances);
+
+        let search_params = Knn::new_default(10, 40).unwrap();
+        let multihop = graph::search::MultihopSearch::new(search_params, &filter);
+        let stats = index
+            .search(
+                multihop,
+                &FullPrecision,
+                &DefaultContext,
+                query.as_slice(),
+                &mut result_output_buffer,
+            )
+            .await
+            .unwrap();
+
+        // The exploration queue should have been activated
+        assert!(
+            filter.reject_expand_count() > 0,
+            "RejectAndNeedExpand should have been returned at least once (got {} visits, {} reject-expand)",
+            filter.visit_count(),
+            filter.reject_expand_count(),
+        );
+
+        // All returned results should be matching IDs
+        for &id in ids.iter().take(stats.result_count as usize) {
+            assert!(
+                matching.contains(&id),
+                "result id {} should be in the matching set",
+                id
+            );
+        }
+
+        // The search should have explored nodes (hops > 0) indicating graph traversal
+        assert!(
+            stats.hops > 0,
+            "search should have performed at least some hops"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exploration_queue_finds_more_results_than_plain_reject() {
+        // Compare: RejectAndNeedExpand (exploration queue active) should find at
+        // least as many results as plain Reject (no exploration queue) when the
+        // match rate is very low.
+        let dim = 3;
+        let grid_size: usize = 7;
+        let num_points = grid_size.pow(dim as u32);
+
+        let (index, _vectors, _) =
+            build_grid_index_for_exploration(dim, grid_size, 0x1122334455667788).await;
+
+        let query = vec![grid_size as f32; dim];
+
+        // Only match every 30th point — very sparse
+        let matching: HashSet<u32> = (0..num_points as u32).filter(|id| id % 30 == 0).collect();
+
+        // --- Run with RejectAndNeedExpand (exploration queue) ---
+        let expand_filter = SparseMatchFilter::new(matching.iter().copied());
+        let mut expand_ids = vec![0; 10];
+        let mut expand_distances = vec![0.0; 10];
+        let mut expand_buffer =
+            search_output_buffer::IdDistance::new(&mut expand_ids, &mut expand_distances);
+
+        let search_params = Knn::new_default(10, 40).unwrap();
+        let multihop = graph::search::MultihopSearch::new(search_params, &expand_filter);
+        let expand_stats = index
+            .search(
+                multihop,
+                &FullPrecision,
+                &DefaultContext,
+                query.as_slice(),
+                &mut expand_buffer,
+            )
+            .await
+            .unwrap();
+
+        // --- Run with plain Reject (no exploration queue) ---
+        // Use an EvenFilter-like filter that returns Reject (not RejectAndNeedExpand)
+        // for non-matching nodes.
+        #[derive(Debug)]
+        struct PlainRejectSparseFilter {
+            matching_ids: HashSet<u32>,
+        }
+
+        impl QueryLabelProvider<u32> for PlainRejectSparseFilter {
+            fn is_match(&self, vec_id: u32) -> bool {
+                self.matching_ids.contains(&vec_id)
+            }
+
+            fn on_visit(&self, neighbor: Neighbor<u32>) -> QueryVisitDecision<u32> {
+                if self.matching_ids.contains(&neighbor.id) {
+                    QueryVisitDecision::Accept(neighbor)
+                } else {
+                    QueryVisitDecision::Reject
+                }
+            }
+        }
+
+        let reject_filter = PlainRejectSparseFilter {
+            matching_ids: matching.clone(),
+        };
+        let mut reject_ids = vec![0; 10];
+        let mut reject_distances = vec![0.0; 10];
+        let mut reject_buffer =
+            search_output_buffer::IdDistance::new(&mut reject_ids, &mut reject_distances);
+
+        let search_params = Knn::new_default(10, 40).unwrap();
+        let multihop = graph::search::MultihopSearch::new(search_params, &reject_filter);
+        let reject_stats = index
+            .search(
+                multihop,
+                &FullPrecision,
+                &DefaultContext,
+                query.as_slice(),
+                &mut reject_buffer,
+            )
+            .await
+            .unwrap();
+
+        // With exploration queue, we should find at least as many results
+        assert!(
+            expand_stats.result_count >= reject_stats.result_count,
+            "exploration queue should find >= results: expand={}, reject={}",
+            expand_stats.result_count,
+            reject_stats.result_count,
+        );
+
+        // All returned results (both runs) should only contain matching IDs
+        for &id in expand_ids.iter().take(expand_stats.result_count as usize) {
+            assert!(
+                matching.contains(&id),
+                "expand result id {} should be in matching set",
+                id
+            );
+        }
+        for &id in reject_ids.iter().take(reject_stats.result_count as usize) {
+            assert!(
+                matching.contains(&id),
+                "reject result id {} should be in matching set",
+                id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exploration_queue_respects_capacity_bound() {
+        // The exploration queue is bounded by l_search. With a small l_search,
+        // verify the search completes without error and doesn't hang. The
+        // capacity enforcement prevents unbounded memory growth.
+        let dim = 3;
+        let grid_size: usize = 5;
+        let _num_points = grid_size.pow(dim as u32);
+
+        let (index, _vectors, _) =
+            build_grid_index_for_exploration(dim, grid_size, 0xDEADBEEFCAFE1234).await;
+
+        let query = vec![grid_size as f32; dim];
+
+        // Only match point 0 — extremely sparse, ensuring the queue fills up
+        let filter = SparseMatchFilter::new([0_u32]);
+
+        let mut ids = vec![0; 5];
+        let mut distances = vec![0.0; 5];
+        let mut result_output_buffer =
+            search_output_buffer::IdDistance::new(&mut ids, &mut distances);
+
+        // Use a very small l_search to stress the capacity bound
+        let search_params = Knn::new_default(5, 5).unwrap();
+        let multihop = graph::search::MultihopSearch::new(search_params, &filter);
+        let stats = index
+            .search(
+                multihop,
+                &FullPrecision,
+                &DefaultContext,
+                query.as_slice(),
+                &mut result_output_buffer,
+            )
+            .await
+            .unwrap();
+
+        // The search should complete without hanging. RejectAndNeedExpand was used.
+        assert!(
+            filter.reject_expand_count() > 0,
+            "exploration queue should have been activated"
+        );
+
+        // All results (if any) should be the matching point
+        for &id in ids.iter().take(stats.result_count as usize) {
+            assert_eq!(id, 0, "only matching point 0 should appear in results");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exploration_queue_deduplication() {
+        // The exploration queue uses an exploration_set to prevent duplicate
+        // entries. Verify the search works correctly when the same rejected
+        // nodes would be encountered multiple times.
+        let dim = 3;
+        let grid_size: usize = 5;
+        let num_points = grid_size.pow(dim as u32);
+
+        let (index, vectors, _) =
+            build_grid_index_for_exploration(dim, grid_size, 0x0F0F0F0F0F0F0F0F).await;
+
+        let _corpus: diskann_utils::views::Matrix<f32> =
+            squish(vectors.iter().take(num_points), dim);
+        let query = vec![grid_size as f32; dim];
+
+        // Match only even IDs — moderate match rate ensuring some dedup paths get exercised
+        let matching: HashSet<u32> = (0..num_points as u32).filter(|id| id % 2 == 0).collect();
+        let filter = SparseMatchFilter::new(matching.iter().copied());
+
+        let mut ids = vec![0; 20];
+        let mut distances = vec![0.0; 20];
+        let mut result_output_buffer =
+            search_output_buffer::IdDistance::new(&mut ids, &mut distances);
+
+        // Large l_search to ensure many iterations and potential duplicate encounters
+        let search_params = Knn::new_default(20, 60).unwrap();
+        let multihop = graph::search::MultihopSearch::new(search_params, &filter);
+        let stats = index
+            .search(
+                multihop,
+                &FullPrecision,
+                &DefaultContext,
+                query.as_slice(),
+                &mut result_output_buffer,
+            )
+            .await
+            .unwrap();
+
+        let result_count = stats.result_count as usize;
+
+        // All returned IDs should be unique (no duplicates from the queue)
+        let result_set: HashSet<u32> = ids.iter().take(result_count).copied().collect();
+        assert_eq!(
+            result_set.len(),
+            result_count,
+            "result IDs should be unique, got {} unique out of {} results",
+            result_set.len(),
+            result_count,
+        );
+
+        // All returned IDs should match the filter
+        for &id in ids.iter().take(result_count) {
+            assert!(
+                matching.contains(&id),
+                "result id {} should be in matching set",
+                id
+            );
+        }
+
+        // Results should be sorted by distance (monotonically non-decreasing)
+        for i in 1..result_count {
+            assert!(
+                distances[i] >= distances[i - 1],
+                "results should be sorted by distance: d[{}]={} < d[{}]={}",
+                i - 1,
+                distances[i - 1],
+                i,
+                distances[i],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exploration_queue_with_mixed_decisions() {
+        // Test a filter that returns a mix of Accept, Reject, and RejectAndNeedExpand.
+        // This exercises the interaction between the standard frontier and the
+        // exploration queue.
+        #[derive(Debug)]
+        struct MixedDecisionFilter {
+            visit_count: Mutex<usize>,
+        }
+
+        impl MixedDecisionFilter {
+            fn new() -> Self {
+                Self {
+                    visit_count: Mutex::new(0),
+                }
+            }
+
+            fn visit_count(&self) -> usize {
+                *self.visit_count.lock().unwrap()
+            }
+        }
+
+        impl QueryLabelProvider<u32> for MixedDecisionFilter {
+            fn is_match(&self, vec_id: u32) -> bool {
+                // Accept even ids via is_match (used in two-hop label check)
+                vec_id % 2 == 0
+            }
+
+            fn on_visit(&self, neighbor: Neighbor<u32>) -> QueryVisitDecision<u32> {
+                *self.visit_count.lock().unwrap() += 1;
+                if neighbor.id % 2 == 0 {
+                    // Even IDs: accepted (matching nodes)
+                    QueryVisitDecision::Accept(neighbor)
+                } else {
+                    // Odd IDs: alternate between Reject and RejectAndNeedExpand
+                    if neighbor.id % 4 == 1 {
+                        QueryVisitDecision::Reject
+                    } else {
+                        QueryVisitDecision::RejectAndNeedExpand
+                    }
+                }
+            }
+        }
+
+        let dim = 3;
+        let grid_size: usize = 5;
+
+        let (index, _vectors, _) =
+            build_grid_index_for_exploration(dim, grid_size, 0xFACEFEED12345678).await;
+
+        let query = vec![grid_size as f32; dim];
+        let filter = MixedDecisionFilter::new();
+
+        let mut ids = vec![0; 10];
+        let mut distances = vec![0.0; 10];
+        let mut result_output_buffer =
+            search_output_buffer::IdDistance::new(&mut ids, &mut distances);
+
+        let search_params = Knn::new_default(10, 40).unwrap();
+        let multihop = graph::search::MultihopSearch::new(search_params, &filter);
+        let stats = index
+            .search(
+                multihop,
+                &FullPrecision,
+                &DefaultContext,
+                query.as_slice(),
+                &mut result_output_buffer,
+            )
+            .await
+            .unwrap();
+
+        // The search should have visited nodes and produced results
+        assert!(
+            filter.visit_count() > 0,
+            "filter should have been invoked"
+        );
+        assert!(
+            stats.result_count > 0,
+            "search should find at least some results with mixed decisions"
+        );
+        assert!(
+            stats.hops > 0,
+            "search should have performed graph traversal"
+        );
+
+        // Results should be sorted by distance
+        let result_count = stats.result_count as usize;
+        for i in 1..result_count {
+            assert!(
+                distances[i] >= distances[i - 1],
+                "results should be distance-sorted: d[{}]={} < d[{}]={}",
+                i - 1,
+                distances[i - 1],
+                i,
+                distances[i],
+            );
+        }
+    }
+
     #[tokio::test]
     async fn vectors_with_infinity_values_should_be_inserted_and_searched_without_panic() {
         let l_build: usize = 20;
